@@ -1,11 +1,29 @@
 /*
  * bme280.c
  *
- *  Created on: Nov 4, 2025
- *      Author: Enes
+ * Created on: Nov 4, 2025
+ * Author: Enes
  */
 
 #include "bme280.h"
+#include "main.h" // LL_DMA_... ve LL_I2C_... için gerekli
+
+/* --- YENİ EKLENEN BÖLÜM --- */
+// Durum makinesi (state machine) için durum tanımları
+typedef enum {
+    BME280_DMA_STATE_IDLE = 0,
+    BME280_DMA_STATE_START,
+    BME280_DMA_STATE_WRITE_ADDR_SENT,
+    BME280_DMA_STATE_REG_ADDR_SENT,
+    BME280_DMA_STATE_RESTART_SENT,
+    BME280_DMA_STATE_READ_ADDR_SENT,
+    BME280_DMA_STATE_READING
+} bme280_dma_state_t;
+
+// Global handle (Kesme fonksiyonlarının erişmesi için)
+bme280_handle g_bme280_dma_handle = NULL;
+/* -------------------------- */
+
 
 typedef enum{
 	chip_id = 0xD0,
@@ -18,38 +36,9 @@ typedef enum{
 	press_msb = 0xF7
 }bme280_register_address;
 
-struct bme280_t{
-	I2C_TypeDef* i2c_handle;
-	uint8_t i2c_addr;
-	uint32_t timeout;
-	bme280_get_tick_func_t get_tick;
-	bme280_config_reg config;
-	bme280_ctrlmeas_reg ctrlmeas;
-	bme280_ctrlhum_reg ctrlhum;
-	uint16_t dig_T1;
-	int16_t dig_T2;
-	int16_t dig_T3;
-	uint16_t dig_P1;
-	int16_t dig_P2;
-	int16_t dig_P3;
-	int16_t dig_P4;
-	int16_t dig_P5;
-	int16_t dig_P6;
-	int16_t dig_P7;
-	int16_t dig_P8;
-	int16_t dig_P9;
-	uint8_t dig_H1;
-	int16_t dig_H2;
-	uint8_t dig_H3;
-	int16_t dig_H4;
-	int16_t dig_H5;
-	int8_t dig_H6;
-	int32_t t_fine;
-	uint8_t raw_data[8];
-	float temperature;
-	float pressure;
-	float humidity;
-};
+/* * struct bme280_t tanımı buradan SİLİNDİ.
+ * Artık bme280.h dosyasında.
+ */
 
 #define BME280_MAX_INSTANCES   2
 static struct bme280_t g_sensor_pool[BME280_MAX_INSTANCES];
@@ -58,6 +47,14 @@ static uint8_t g_next_free_index=0;
 bme280_return_stats static read_register(bme280_handle dev, uint8_t reg_addr, uint8_t* rxdata, uint8_t size){
 	uint32_t time;
 	if(size == 0) return bme280_read_fail;
+
+    // DMA kullanılırken polling fonksiyonunun çağrılmadığından emin ol
+    if(dev->i2c_dma_state != BME280_DMA_STATE_IDLE) return bme280_fail;
+    time = dev->get_tick();
+	while(LL_I2C_IsActiveFlag_BUSY(dev->i2c_handle)) {
+        if(dev->get_tick() - time > dev->timeout) return bme280_timeout;
+    }
+
 	LL_I2C_GenerateStartCondition(dev->i2c_handle);
 	time = dev->get_tick();
 	while(!LL_I2C_IsActiveFlag_SB(dev->i2c_handle)){
@@ -108,6 +105,14 @@ bme280_return_stats static read_register(bme280_handle dev, uint8_t reg_addr, ui
 bme280_return_stats static write_register(bme280_handle dev, uint8_t reg_addr, uint8_t* txdata, uint8_t size){
 	uint32_t time = 0;
 	if(size == 0) return bme280_write_fail;
+
+    // DMA kullanılırken polling fonksiyonunun çağrılmadığından emin ol
+    if(dev->i2c_dma_state != BME280_DMA_STATE_IDLE) return bme280_fail;
+    time = dev->get_tick();
+	while(LL_I2C_IsActiveFlag_BUSY(dev->i2c_handle)) {
+        if(dev->get_tick() - time > dev->timeout) return bme280_timeout;
+    }
+
 	LL_I2C_GenerateStartCondition(dev->i2c_handle);
 	time = dev->get_tick();
 	while(!LL_I2C_IsActiveFlag_SB(dev->i2c_handle)){
@@ -210,6 +215,9 @@ bme280_handle bme280_init(bme280_user_configs* config){
 	dev->dig_H6 = (int8_t)(temp_buffer[6]);
 	status = bme280_configurate(dev, config);
 	if(status!=bme280_ok) return NULL;
+
+    dev->i2c_dma_state = BME280_DMA_STATE_IDLE; // Durumu 'Boşta' olarak başlat
+
 	return dev;
 }
 
@@ -286,23 +294,56 @@ bme280_return_stats  bme280_get_values(bme280_handle dev){
     return bme280_ok;
 }
 
-bme280_return_stats bme280_get_data_forced(bme280_handle dev)
+
+/* * ============================================================================
+ * ===                        YENİDEN YAZILAN DMA BÖLÜMÜ                      ===
+ * ============================================================================
+ * Bizim eski "polling" (while döngülü) fonksiyonumuzun yerine,
+ * kursta öğrendiğimiz "Olay Güdümlü" (Event-Driven) mimariyi kullanıyoruz.
+ * Bu fonksiyon artık SADECE tetiği çeker (non-blocking).
+ * Tüm iş, stm32f4xx_it.c dosyasındaki I2C1_EV_IRQHandler tarafından yapılır.
+ */
+bme280_return_stats bme280_read_data_dma(bme280_handle dev)
 {
-    bme280_return_stats status;
     uint32_t time;
-    uint8_t status_reg;
-    dev->ctrlmeas.bits.mode = 0b01;
-    status = write_register(dev, addr_ctrlmeas, &(dev->ctrlmeas.raw), 1);
-    if(status != bme280_ok) return status;
+
+    /* 1. I2C BUSY mı veya başka bir DMA işlemi yolda mı? */
     time = dev->get_tick();
-    do
+    while(LL_I2C_IsActiveFlag_BUSY(dev->i2c_handle))
     {
-        status = read_register(dev, 0xF3, &status_reg, 1);
-        if (status != bme280_ok) return status;
-        if(dev->get_tick() - time > dev->timeout) return bme280_timeout;
-    } while (status_reg & (1 << 3));
-    status = bme280_read_data_poll(dev);
-    if (status != bme280_ok) return status;
-    bme280_get_values(dev);
+        if(dev->get_tick() - time > dev->timeout) {
+            return bme280_fail; // BUSY hatası
+        }
+    }
+
+    if (dev->i2c_dma_state != BME280_DMA_STATE_IDLE)
+    {
+        return bme280_fail; // Önceki DMA bitmemiş
+    }
+
+    /* 2. Global handle'ı ve durumu ayarla (Interrupt'ların erişmesi için) */
+    g_bme280_dma_handle = dev;
+    dev->i2c_dma_state = BME280_DMA_STATE_START; // 1. Durum: START
+
+    /* 3. Tüm hata bayraklarını temizle (yeni bir başlangıç için) */
+    LL_I2C_ClearFlag_AF(dev->i2c_handle);
+    LL_I2C_ClearFlag_BERR(dev->i2c_handle);
+    LL_DMA_ClearFlag_TC0(DMA1);
+    LL_DMA_ClearFlag_TE0(DMA1);
+
+    /* 4. Gerekli kesmeleri (interrupt) AÇ */
+    // KURSTAN ÖĞRENDİĞİMİZ ANAHTAR: Olay kesmesini aç!
+    LL_I2C_EnableIT_EVT(dev->i2c_handle);
+    LL_I2C_EnableIT_BUF(dev->i2c_handle); // <-- 3. Durum (TXE) için bu şart!
+    LL_I2C_EnableIT_ERR(dev->i2c_handle);
+    // KURSTAN ÖĞRENDİĞİMİZ 2. ANAHTAR: DMA Hata kesmesini aç!
+    LL_DMA_EnableIT_TE(DMA1, LL_DMA_STREAM_0);
+    LL_DMA_EnableIT_TC(DMA1, LL_DMA_STREAM_0);
+
+    /* 5. Orkestrayı başlat: START Condition gönder */
+    // I2C1_EV_IRQHandler (SB bayrağı ile) şimdi tetiklenecek...
+    LL_I2C_GenerateStartCondition(dev->i2c_handle);
+
+    // Fonksiyon BİTTİ. Gerisi I2C1_EV_IRQHandler'da...
     return bme280_ok;
 }
