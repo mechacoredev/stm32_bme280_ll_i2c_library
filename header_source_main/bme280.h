@@ -1,15 +1,16 @@
 /*
  * bme280.h
  *
- *  Created on: Nov 4, 2025
- *      Author: Enes
+ * Created on: Nov 4, 2025
+ * Author: Enes
  */
 
 #ifndef INC_BME280_H_
 #define INC_BME280_H_
 
-#include "stm32f407xx.h"
+#include "stm32f4xx.h" // main.h yerine bunu kullanmak daha standarttır
 #include "stm32f4xx_ll_i2c.h"
+#include "stm32f4xx_ll_dma.h"
 #include "stddef.h"
 #include "stdbool.h"
 
@@ -69,10 +70,51 @@ typedef struct{
 	bme280_get_tick_func_t get_tick;
 }bme280_user_configs;
 
+
+/*
+ * ============================================================================
+ * ===             STRUCT TANIMI BURADA OLMALI (IT.c GÖRMELİ)             ===
+ * ============================================================================
+ */
+struct bme280_t{
+	I2C_TypeDef* i2c_handle;
+	uint8_t i2c_addr;
+	uint32_t timeout;
+	bme280_get_tick_func_t get_tick;
+	bme280_config_reg config;
+	bme280_ctrlmeas_reg ctrlmeas;
+	bme280_ctrlhum_reg ctrlhum;
+	volatile uint8_t i2c_dma_state; // Bizim durum makinemiz (state machine)
+	uint16_t dig_T1;
+	int16_t dig_T2;
+	int16_t dig_T3;
+	uint16_t dig_P1;
+	int16_t dig_P2;
+	int16_t dig_P3;
+	int16_t dig_P4;
+	int16_t dig_P5;
+	int16_t dig_P6;
+	int16_t dig_P7;
+	int16_t dig_P8;
+	int16_t dig_P9;
+	uint8_t dig_H1;
+	int16_t dig_H2;
+	uint8_t dig_H3;
+	int16_t dig_H4;
+	int16_t dig_H5;
+	int8_t dig_H6;
+	int32_t t_fine;
+	uint8_t raw_data[8];
+	float temperature;
+	float pressure;
+	float humidity;
+};
+
+
 bme280_handle bme280_init(bme280_user_configs* config);
 bme280_return_stats bme280_configurate(bme280_handle dev, bme280_user_configs* config);
 bme280_return_stats bme280_read_data_poll(bme280_handle dev);
-bme280_return_stats  bme280_get_values(bme280_handle dev);
-bme280_return_stats bme280_get_data_forced(bme280_handle dev);
+bme280_return_stats bme280_get_values(bme280_handle dev);
+bme280_return_stats bme280_read_data_dma(bme280_handle dev);
 
 #endif /* INC_BME280_H_ */
