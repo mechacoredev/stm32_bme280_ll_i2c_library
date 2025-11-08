@@ -1,238 +1,187 @@
-/*
- * bme280.c
- *
- * Created on: Nov 4, 2025
- * Author: Enes
- */
-
 #include "bme280.h"
-#include "main.h" // LL_DMA_... ve LL_I2C_... için gerekli
-
-/* --- YENİ EKLENEN BÖLÜM --- */
-// Durum makinesi (state machine) için durum tanımları
-typedef enum {
-    BME280_DMA_STATE_IDLE = 0,
-    BME280_DMA_STATE_START,
-    BME280_DMA_STATE_WRITE_ADDR_SENT,
-    BME280_DMA_STATE_REG_ADDR_SENT,
-    BME280_DMA_STATE_RESTART_SENT,
-    BME280_DMA_STATE_READ_ADDR_SENT,
-    BME280_DMA_STATE_READING
-} bme280_dma_state_t;
-
-// Global handle (Kesme fonksiyonlarının erişmesi için)
-bme280_handle g_bme280_dma_handle = NULL;
-/* -------------------------- */
-
+extern volatile uint8_t bme_data_ready;
 
 typedef enum{
-	chip_id = 0xD0,
-	dig_T1 = 0x88,
-	dig_H1 = 0xA1,
-	dig_H2 = 0xE1,
-	addr_config = 0xF5,
-	addr_ctrlmeas = 0xF4,
-	addr_ctrlhum = 0xF2,
-	press_msb = 0xF7
+	dma_state_idle=0,
+	dma_state_start_sent,
+	dma_state_write_addr_sent,
+	dma_state_reg_addr_sent,
+	dma_state_restart_sent,
+	dma_state_read_addr_sent,
+	dma_state_reading,
+}bme280_dma_state_t;
+
+struct bme280_t{
+	I2C_TypeDef* i2c_handle;
+	uint8_t i2c_addr;
+	uint32_t timeout;
+	bme280_get_tick get_tick;
+	bme280_config_t config_t;
+	bme280_ctrlmeas_t ctrlmeas_t;
+	bme280_ctrlhum_t ctrlhum_t;
+	uint16_t dig_T1;
+	int16_t dig_T2;
+	int16_t dig_T3;
+	uint16_t dig_P1;
+	int16_t dig_P2;
+	int16_t dig_P3;
+	int16_t dig_P4;
+	int16_t dig_P5;
+	int16_t dig_P6;
+	int16_t dig_P7;
+	int16_t dig_P8;
+	int16_t dig_P9;
+	uint8_t dig_H1;
+	int16_t dig_H2;
+	uint8_t dig_H3;
+	int16_t dig_H4;
+	int16_t dig_H5;
+	int8_t dig_H6;
+	uint8_t raw_data[8];
+	int32_t t_fine;
+	float temperature;
+	float pressure;
+	float humidity;
+	volatile bme280_dma_state_t dma_state;
+};
+
+typedef enum{
+	addr_chip_id=0xD0,
+	addr_reset=0xE0,
+	addr_ctrlhum=0xF2,
+	addr_status=0xF3,
+	addr_ctrlmeas=0xF4,
+	addr_config=0xF5,
+	addr_press_msb=0xF7,
+	addr_dig_t1=0x88,
+	addr_dig_h1=0xA1,
+	addr_dig_h2=0xE1,
 }bme280_register_address;
 
-/* * struct bme280_t tanımı buradan SİLİNDİ.
- * Artık bme280.h dosyasında.
- */
+#define max_instances 2
+static struct bme280_t sensor_pool[max_instances];
+static uint8_t next_free_index=0;
+static bme280_handle active_dma_handle=NULL;
 
-#define BME280_MAX_INSTANCES   2
-static struct bme280_t g_sensor_pool[BME280_MAX_INSTANCES];
-static uint8_t g_next_free_index=0;
+static uint8_t flag_busy(bme280_handle dev){
+	return !LL_I2C_IsActiveFlag_BUSY(dev->i2c_handle);
+}
 
-bme280_return_stats static read_register(bme280_handle dev, uint8_t reg_addr, uint8_t* rxdata, uint8_t size){
-	uint32_t time;
-	if(size == 0) return bme280_read_fail;
+static uint8_t flag_sb(bme280_handle dev){
+	return LL_I2C_IsActiveFlag_SB(dev->i2c_handle);
+}
 
-    // DMA kullanılırken polling fonksiyonunun çağrılmadığından emin ol
-    if(dev->i2c_dma_state != BME280_DMA_STATE_IDLE) return bme280_fail;
-    time = dev->get_tick();
-	while(LL_I2C_IsActiveFlag_BUSY(dev->i2c_handle)) {
-        if(dev->get_tick() - time > dev->timeout) return bme280_timeout;
-    }
+static uint8_t flag_addr(bme280_handle dev){
+	return LL_I2C_IsActiveFlag_ADDR(dev->i2c_handle);
+}
 
+static uint8_t flag_txe(bme280_handle dev){
+	return LL_I2C_IsActiveFlag_TXE(dev->i2c_handle);
+}
+
+static uint8_t flag_rxne(bme280_handle dev){
+	return LL_I2C_IsActiveFlag_RXNE(dev->i2c_handle);
+}
+
+static uint8_t flag_btf(bme280_handle dev){
+	return LL_I2C_IsActiveFlag_BTF(dev->i2c_handle);
+}
+
+static uint8_t flag_addr_or_af(bme280_handle dev){
+	return LL_I2C_IsActiveFlag_ADDR(dev->i2c_handle) || LL_I2C_IsActiveFlag_AF(dev->i2c_handle);
+}
+
+typedef uint8_t (*bme280_condition_t)(bme280_handle dev);
+static bme280_return_status wait_for_condition(bme280_handle dev, bme280_condition_t condition_met){
+	uint32_t time = dev->get_tick();
+	while(condition_met(dev) == 0){
+		if(dev->get_tick() - time > dev->timeout) return _bme280_timeout;
+	}
+	return _bme280_ok;
+}
+
+static bme280_return_status read_register(bme280_handle dev, uint8_t reg_addr, uint8_t* rxdata, uint8_t size){
+	if(size == 0) return _bme280_fail;
+	if(LL_I2C_IsActiveFlag_RXNE(dev->i2c_handle)){
+		 (void)LL_I2C_ReceiveData8(dev->i2c_handle); return _bme280_rxne_leak;
+	}
+	if(wait_for_condition(dev, flag_busy)!=_bme280_ok){
+		LL_I2C_GenerateStopCondition(dev->i2c_handle); return _bme280_i2c_busy;
+	}
 	LL_I2C_GenerateStartCondition(dev->i2c_handle);
-	time = dev->get_tick();
-	while(!LL_I2C_IsActiveFlag_SB(dev->i2c_handle)){
-		if(dev->get_tick() - time > dev->timeout) return bme280_timeout;
+	if(wait_for_condition(dev, flag_sb)!=_bme280_ok){
+		LL_I2C_GenerateStopCondition(dev->i2c_handle); return _bme280_timeout;
 	}
 	LL_I2C_TransmitData8(dev->i2c_handle, dev->i2c_addr);
-	time = dev->get_tick();
-	while(!LL_I2C_IsActiveFlag_ADDR(dev->i2c_handle)){
-		if(dev->get_tick() - time > dev->timeout) return bme280_timeout;
+	if(wait_for_condition(dev, flag_addr)!=_bme280_ok){
+		LL_I2C_GenerateStopCondition(dev->i2c_handle); return _bme280_timeout;
 	}
 	LL_I2C_ClearFlag_ADDR(dev->i2c_handle);
 	LL_I2C_TransmitData8(dev->i2c_handle, reg_addr);
-	time = dev->get_tick();
-	while(!LL_I2C_IsActiveFlag_TXE(dev->i2c_handle)){
-		if(dev->get_tick() - time > dev->timeout) return bme280_timeout;
+	if(wait_for_condition(dev, flag_txe)!=_bme280_ok){
+		LL_I2C_GenerateStopCondition(dev->i2c_handle); return _bme280_timeout;
 	}
 	LL_I2C_GenerateStartCondition(dev->i2c_handle);
-	time = dev->get_tick();
-	while(!LL_I2C_IsActiveFlag_SB(dev->i2c_handle)){
-		if(dev->get_tick() - time > dev->timeout) return bme280_timeout;
+	if(wait_for_condition(dev, flag_sb)!=_bme280_ok){
+		LL_I2C_GenerateStopCondition(dev->i2c_handle); return _bme280_timeout;
 	}
-	LL_I2C_TransmitData8(dev->i2c_handle, dev->i2c_addr | 1);
-	time = dev->get_tick();
-	while(!LL_I2C_IsActiveFlag_ADDR(dev->i2c_handle)){
-		if(dev->get_tick() - time > dev->timeout) return bme280_timeout;
+	LL_I2C_TransmitData8(dev->i2c_handle, dev->i2c_addr|1);
+	if(wait_for_condition(dev, flag_addr)!=_bme280_ok){
+		LL_I2C_GenerateStopCondition(dev->i2c_handle); return _bme280_timeout;
 	}
 	LL_I2C_ClearFlag_ADDR(dev->i2c_handle);
 	LL_I2C_AcknowledgeNextData(dev->i2c_handle, LL_I2C_ACK);
-	while(size-1){
-		time = dev->get_tick();
-		while(!LL_I2C_IsActiveFlag_RXNE(dev->i2c_handle)){
-			if(dev->get_tick() - time > dev->timeout) return bme280_timeout;
+	while(size>1){
+		if(wait_for_condition(dev, flag_rxne)!=_bme280_ok){
+			LL_I2C_GenerateStopCondition(dev->i2c_handle); return _bme280_timeout;
 		}
-		*rxdata = LL_I2C_ReceiveData8(dev->i2c_handle);
+		*rxdata=LL_I2C_ReceiveData8(dev->i2c_handle);
 		rxdata++;
 		size--;
 	}
 	LL_I2C_AcknowledgeNextData(dev->i2c_handle, LL_I2C_NACK);
-	LL_I2C_GenerateStopCondition(dev->i2c_handle);
-	time = dev->get_tick();
-	while(!LL_I2C_IsActiveFlag_RXNE(dev->i2c_handle)){
-		if(dev->get_tick() - time > dev->timeout) return bme280_timeout;
+	if(wait_for_condition(dev, flag_rxne)!=_bme280_ok){
+		LL_I2C_GenerateStopCondition(dev->i2c_handle); return _bme280_timeout;
 	}
-	*rxdata = LL_I2C_ReceiveData8(dev->i2c_handle);
-	return bme280_ok;
+	*rxdata=LL_I2C_ReceiveData8(dev->i2c_handle);
+	LL_I2C_GenerateStopCondition(dev->i2c_handle);
+	return _bme280_ok;
 }
 
-bme280_return_stats static write_register(bme280_handle dev, uint8_t reg_addr, uint8_t* txdata, uint8_t size){
-	uint32_t time = 0;
-	if(size == 0) return bme280_write_fail;
-
-    // DMA kullanılırken polling fonksiyonunun çağrılmadığından emin ol
-    if(dev->i2c_dma_state != BME280_DMA_STATE_IDLE) return bme280_fail;
-    time = dev->get_tick();
-	while(LL_I2C_IsActiveFlag_BUSY(dev->i2c_handle)) {
-        if(dev->get_tick() - time > dev->timeout) return bme280_timeout;
-    }
-
+static bme280_return_status write_register(bme280_handle dev, uint8_t reg_addr, uint8_t* txdata, uint8_t size){
+	if(size==0) return _bme280_fail;
+	if(LL_I2C_IsActiveFlag_RXNE(dev->i2c_handle)){
+		 (void)LL_I2C_ReceiveData8(dev->i2c_handle); return _bme280_rxne_leak;
+	}
+	if(wait_for_condition(dev, flag_busy)!=_bme280_ok){
+		LL_I2C_GenerateStopCondition(dev->i2c_handle); return _bme280_i2c_busy;
+	}
 	LL_I2C_GenerateStartCondition(dev->i2c_handle);
-	time = dev->get_tick();
-	while(!LL_I2C_IsActiveFlag_SB(dev->i2c_handle)){
-		if(dev->get_tick() - time > dev->timeout) return bme280_timeout;
+	if(wait_for_condition(dev, flag_sb)!=_bme280_ok){
+		LL_I2C_GenerateStopCondition(dev->i2c_handle); return _bme280_timeout;
 	}
 	LL_I2C_TransmitData8(dev->i2c_handle, dev->i2c_addr);
-	time = dev->get_tick();
-	while(!LL_I2C_IsActiveFlag_ADDR(dev->i2c_handle)){
-		if(dev->get_tick() - time > dev->timeout) return bme280_timeout;
+	if(wait_for_condition(dev, flag_addr)!=_bme280_ok){
+		LL_I2C_GenerateStopCondition(dev->i2c_handle); return _bme280_timeout;
 	}
 	LL_I2C_ClearFlag_ADDR(dev->i2c_handle);
 	LL_I2C_TransmitData8(dev->i2c_handle, reg_addr);
-	time = dev->get_tick();
-	while(!LL_I2C_IsActiveFlag_TXE(dev->i2c_handle)){
-		if(dev->get_tick() - time > dev->timeout) return bme280_timeout;
+	if(wait_for_condition(dev, flag_txe)!=_bme280_ok){
+		LL_I2C_GenerateStopCondition(dev->i2c_handle); return _bme280_timeout;
 	}
-	while(size > 0){
+	while(size>0){
 		LL_I2C_TransmitData8(dev->i2c_handle, *txdata);
-		time = dev->get_tick();
-		while(!LL_I2C_IsActiveFlag_TXE(dev->i2c_handle)){
-			if(dev->get_tick() - time > dev->timeout) return bme280_timeout;
-		}
 		txdata++;
 		size--;
-	}
-	time = dev->get_tick();
-	while(!LL_I2C_IsActiveFlag_BTF(dev->i2c_handle)){
-		if(dev->get_tick() - time > dev->timeout) return bme280_timeout;
-	}
-	LL_I2C_GenerateStopCondition(dev->i2c_handle);
-	return bme280_ok;
-}
-
-bme280_return_stats static find_bme280(bme280_user_configs* config){
-	uint32_t time;
-	LL_I2C_GenerateStartCondition(config->i2c_handle);
-	time = config->get_tick();
-	while(!LL_I2C_IsActiveFlag_SB(config->i2c_handle)){
-		if(config->get_tick() - time > config->timeout) return bme280_timeout;
-	}
-	LL_I2C_TransmitData8(config->i2c_handle, config->i2c_addr);
-	time = config->get_tick();
-	while(!LL_I2C_IsActiveFlag_ADDR(config->i2c_handle) && !LL_I2C_IsActiveFlag_AF(config->i2c_handle)){
-		if(config->get_tick() - time > config->timeout){
-			LL_I2C_GenerateStopCondition(config->i2c_handle);
-			return bme280_timeout;
+		if(wait_for_condition(dev, flag_txe)!=_bme280_ok){
+			LL_I2C_GenerateStopCondition(dev->i2c_handle); return _bme280_timeout;
 		}
 	}
-	if(!LL_I2C_IsActiveFlag_ADDR(config->i2c_handle)){
-		LL_I2C_ClearFlag_AF(config->i2c_handle);
-		LL_I2C_GenerateStopCondition(config->i2c_handle);
-		return bme280_device_not_found;
+	if(wait_for_condition(dev, flag_btf)!=_bme280_ok){
+		LL_I2C_GenerateStopCondition(dev->i2c_handle); return _bme280_timeout;
 	}
-	LL_I2C_ClearFlag_ADDR(config->i2c_handle);
-	LL_I2C_GenerateStopCondition(config->i2c_handle);
-	return bme280_ok;
-}
-
-bme280_handle bme280_init(bme280_user_configs* config){
-	if(g_next_free_index >= BME280_MAX_INSTANCES) return NULL;
-	if(config->get_tick == NULL) return NULL;
-	if((config->i2c_addr != i2c_addr_0) && (config->i2c_addr != i2c_addr_1)) return NULL;
-	if(config->i2c_handle != I2C1 && config->i2c_handle != I2C2 && config->i2c_handle != I2C3) return NULL;
-	uint32_t time = config->get_tick();
-	while(LL_I2C_IsActiveFlag_BUSY(config->i2c_handle)) if(config->get_tick() - time > config->timeout) return NULL;
-	if(find_bme280(config)!=bme280_ok) return NULL;
-	bme280_handle dev = &g_sensor_pool[g_next_free_index];
-	g_next_free_index++;
-	dev->i2c_handle = config->i2c_handle;
-	dev->i2c_addr = config->i2c_addr;
-	dev->timeout = config->timeout;
-	dev->get_tick = config->get_tick;
-	uint8_t buffer;
-	read_register(dev, chip_id, &buffer, 1);
-	if(buffer!=0x60) return NULL;
-	uint8_t temp_buffer[26];
-	bme280_return_stats status;
-	status = read_register(dev, dig_T1, temp_buffer, 24);
-	if(status != bme280_ok) return NULL;
-	dev->dig_T1 = (uint16_t)((temp_buffer[1] << 8)|(temp_buffer[0]));
-	dev->dig_T2 = (int16_t)((temp_buffer[3] << 8)|(temp_buffer[2]));
-	dev->dig_T3 = (int16_t)((temp_buffer[5] << 8)|(temp_buffer[4]));
-	dev->dig_P1 = (uint16_t)((temp_buffer[7] << 8)|(temp_buffer[6]));
-	dev->dig_P2 = (int16_t)((temp_buffer[9] << 8)|(temp_buffer[8]));
-	dev->dig_P3 = (int16_t)((temp_buffer[11] << 8)|(temp_buffer[10]));
-	dev->dig_P4 = (int16_t)((temp_buffer[13] << 8)|(temp_buffer[12]));
-	dev->dig_P5 = (int16_t)((temp_buffer[15] << 8)|(temp_buffer[14]));
-	dev->dig_P6 = (int16_t)((temp_buffer[17] << 8)|(temp_buffer[16]));
-	dev->dig_P7 = (int16_t)((temp_buffer[19] << 8)|(temp_buffer[18]));
-	dev->dig_P8 = (int16_t)((temp_buffer[21] << 8)|(temp_buffer[20]));
-	dev->dig_P9 = (int16_t)((temp_buffer[23] << 8)|(temp_buffer[22]));
-	status = read_register(dev, dig_H1, &(dev->dig_H1), 1);
-	if(status != bme280_ok) return NULL;
-	status = read_register(dev, dig_H2, temp_buffer, 7);
-	if(status != bme280_ok) return NULL;
-	dev->dig_H2 = (int16_t)((temp_buffer[1] << 8)|(temp_buffer[0]));
-	dev->dig_H3 = temp_buffer[2];
-	dev->dig_H4 = (int16_t)((temp_buffer[3] << 4)|(temp_buffer[4] & 0x0F));
-	dev->dig_H5 = (int16_t)((temp_buffer[5] << 4)|(temp_buffer[4] >> 4));
-	dev->dig_H6 = (int8_t)(temp_buffer[6]);
-	status = bme280_configurate(dev, config);
-	if(status!=bme280_ok) return NULL;
-
-    dev->i2c_dma_state = BME280_DMA_STATE_IDLE; // Durumu 'Boşta' olarak başlat
-
-	return dev;
-}
-
-bme280_return_stats bme280_configurate(bme280_handle dev, bme280_user_configs* config){
-	dev->config.raw = config->config.raw;
-	dev->ctrlhum.raw = config->ctrlhum.raw;
-	dev->ctrlmeas.raw = config->ctrlmeas.raw;
-	bme280_return_stats status;
-	status = write_register(dev, addr_ctrlhum, &(dev->ctrlhum.raw), 1);
-	if(status!=bme280_ok) return bme280_fail;
-	status = write_register(dev, addr_config, &(dev->config.raw), 1);
-	if(status!=bme280_ok) return bme280_fail;
-	status = write_register(dev, addr_ctrlmeas, &(dev->ctrlmeas.raw), 1);
-	if(status!=bme280_ok) return bme280_fail;
-	return bme280_ok;
+	LL_I2C_GenerateStopCondition(dev->i2c_handle);
+	return _bme280_ok;
 }
 
 static int32_t inline compensate_temperature(bme280_handle dev, int32_t adc_T)
@@ -277,73 +226,266 @@ static uint32_t inline compensate_humidity(bme280_handle dev, int32_t adc_H)
     return (uint32_t)(v_x1_u32r >> 12);
 }
 
-bme280_return_stats bme280_read_data_poll(bme280_handle dev){
-	bme280_return_stats status;
-	status = read_register(dev, press_msb, dev->raw_data, 8);
-	return status;
+bme280_return_status bme280_check_device(bme280_user_configs* config){
+	if(config==NULL) return _bme280_info_leak;
+	if(config->get_tick==NULL) return _bme280_info_leak;
+	if(config->i2c_addr != bme280_i2c_addr0 && config->i2c_addr != bme280_i2c_addr1) return _bme280_info_leak;
+	if(config->i2c_handle != I2C1 && config->i2c_handle != I2C2 && config->i2c_handle != I2C3) return _bme280_info_leak;
+	if(config->timeout==0) return _bme280_info_leak;
+	if(LL_I2C_IsActiveFlag_RXNE(config->i2c_handle)){
+		(void)LL_I2C_ReceiveData8(config->i2c_handle); LL_I2C_GenerateStopCondition(config->i2c_handle); return _bme280_rxne_leak;
+	}
+	if(LL_I2C_IsActiveFlag_BUSY(config->i2c_handle)){
+		LL_I2C_GenerateStopCondition(config->i2c_handle); return _bme280_i2c_busy;
+	}
+	LL_I2C_GenerateStartCondition(config->i2c_handle);
+	if(wait_for_condition((bme280_handle)config, flag_sb)!=_bme280_ok){
+		LL_I2C_GenerateStopCondition(config->i2c_handle); return _bme280_timeout;
+	}
+	LL_I2C_TransmitData8(config->i2c_handle, config->i2c_addr);
+	if(wait_for_condition((bme280_handle)config, flag_addr_or_af)==_bme280_timeout){
+		LL_I2C_GenerateStopCondition(config->i2c_handle); return _bme280_timeout;
+	}
+	if(LL_I2C_IsActiveFlag_ADDR(config->i2c_handle)){
+		LL_I2C_ClearFlag_ADDR(config->i2c_handle); LL_I2C_GenerateStopCondition(config->i2c_handle); return _bme280_ok;
+	}
+	LL_I2C_ClearFlag_AF(config->i2c_handle); LL_I2C_GenerateStopCondition(config->i2c_handle); return _bme280_device_not_found;
 }
 
-bme280_return_stats  bme280_get_values(bme280_handle dev){
-    int32_t adc_P = (int32_t)(((uint32_t)dev->raw_data[0] << 12) | ((uint32_t)dev->raw_data[1] << 4) | ((uint32_t)dev->raw_data[2] >> 4));
-    int32_t adc_T = (int32_t)(((uint32_t)dev->raw_data[3] << 12) | ((uint32_t)dev->raw_data[4] << 4) | ((uint32_t)dev->raw_data[5] >> 4));
-    int32_t adc_H = (int32_t)(((uint32_t)dev->raw_data[6] << 8) | dev->raw_data[7]);
-
-    dev->temperature = (float)compensate_temperature(dev, adc_T) / 100.0f;
-    dev->pressure = (float)compensate_pressure(dev, adc_P) / 256.0f / 100.0f;
-    dev->humidity = (float)compensate_humidity(dev, adc_H) / 1024.0f;
-    return bme280_ok;
+bme280_handle bme280_init(bme280_user_configs* config){
+	if(next_free_index >= max_instances) return NULL;
+	if(config==NULL) return NULL;
+	if(config->get_tick==NULL) return NULL;
+	if(config->i2c_addr != bme280_i2c_addr0 && config->i2c_addr != bme280_i2c_addr1) return NULL;
+	if(config->i2c_handle != I2C1 && config->i2c_handle != I2C2 && config->i2c_handle != I2C3) return NULL;
+	if(config->timeout==0) return NULL;
+	bme280_handle dev = &sensor_pool[next_free_index];
+	next_free_index++;
+	dev->i2c_handle=config->i2c_handle;
+	dev->i2c_addr=config->i2c_addr;
+	dev->get_tick=config->get_tick;
+	dev->timeout=config->timeout;
+	dev->config_t.raw=config->config_t.raw;
+	dev->ctrlhum_t.raw=config->ctrlhum_t.raw;
+	dev->ctrlmeas_t.raw=config->ctrlmeas_t.raw;
+	uint8_t buffer;
+	bme280_return_status status = read_register(dev, addr_chip_id, &buffer, 1);
+	if(status!=_bme280_ok || buffer!=0x60){
+		next_free_index--;
+		return NULL;
+	}
+	uint8_t comp_buffer[24];
+	status = read_register(dev, addr_dig_t1, comp_buffer, 24);
+	if(status!=_bme280_ok){
+		next_free_index--;
+		return NULL;
+	}
+	dev->dig_T1=(uint16_t)(comp_buffer[1]<<8)|(comp_buffer[0]);
+	dev->dig_T2=(int16_t)(comp_buffer[3]<<8)|(comp_buffer[2]);
+	dev->dig_T3=(int16_t)(comp_buffer[5]<<8)|(comp_buffer[4]);
+	dev->dig_P1=(uint16_t)(comp_buffer[7]<<8)|(comp_buffer[6]);
+	dev->dig_P2=(int16_t)(comp_buffer[9]<<8)|(comp_buffer[8]);
+	dev->dig_P3=(int16_t)(comp_buffer[11]<<8)|(comp_buffer[10]);
+	dev->dig_P4=(int16_t)(comp_buffer[13]<<8)|(comp_buffer[12]);
+	dev->dig_P5=(int16_t)(comp_buffer[15]<<8)|(comp_buffer[14]);
+	dev->dig_P6=(int16_t)(comp_buffer[17]<<8)|(comp_buffer[16]);
+	dev->dig_P7=(int16_t)(comp_buffer[19]<<8)|(comp_buffer[18]);
+	dev->dig_P8=(int16_t)(comp_buffer[21]<<8)|(comp_buffer[20]);
+	dev->dig_P9=(int16_t)(comp_buffer[23]<<8)|(comp_buffer[22]);
+	status = read_register(dev, addr_dig_h1, &(dev->dig_H1), 1);
+	if(status!=_bme280_ok){
+		next_free_index--;
+		return NULL;
+	}
+	status = read_register(dev, addr_dig_h2, comp_buffer, 7);
+	if(status!=_bme280_ok){
+		next_free_index--;
+		return NULL;
+	}
+	dev->dig_H2=(int16_t)(comp_buffer[1]<<8)|(comp_buffer[0]);
+	dev->dig_H3=comp_buffer[2];
+	dev->dig_H4=(int16_t)((comp_buffer[3]<<4)|(comp_buffer[4]&0x0F));
+	dev->dig_H5=(int16_t)((comp_buffer[5]<<4)|(comp_buffer[4]>>4));
+	dev->dig_H6=(int8_t)comp_buffer[6];
+	dev->dma_state=dma_state_idle; //dma state işte burada alo
+	status = write_register(dev, addr_ctrlhum, &(dev->ctrlhum_t.raw), 1);
+	if(status!=_bme280_ok){
+		next_free_index--;
+		return NULL;
+	}
+	status = write_register(dev, addr_config, &(dev->config_t.raw), 1);
+	if(status!=_bme280_ok){
+		next_free_index--;
+		return NULL;
+	}
+	status = write_register(dev, addr_ctrlmeas, &(dev->ctrlmeas_t.raw), 1);
+	if(status!=_bme280_ok){
+		next_free_index--;
+		return NULL;
+	}
+	return dev;
 }
 
+bme280_return_status bme280_reset(bme280_handle dev){
+	uint8_t buffer = 0xB6;
+	bme280_return_status status = write_register(dev, addr_reset, &buffer, 1);
+	if(status!=_bme280_ok) return status;
+	status = write_register(dev, addr_ctrlhum, &(dev->ctrlhum_t.raw), 1);
+	if(status!=_bme280_ok) return _bme280_write_fail;
+	status = write_register(dev, addr_config, &(dev->config_t.raw), 1);
+	if(status!=_bme280_ok) return _bme280_write_fail;
+	status = write_register(dev, addr_ctrlmeas, &(dev->ctrlmeas_t.raw), 1);
+	if(status!=_bme280_ok) return _bme280_write_fail;
+	return _bme280_ok;
+}
 
-/* * ============================================================================
- * ===                        YENİDEN YAZILAN DMA BÖLÜMÜ                      ===
- * ============================================================================
- * Bizim eski "polling" (while döngülü) fonksiyonumuzun yerine,
- * kursta öğrendiğimiz "Olay Güdümlü" (Event-Driven) mimariyi kullanıyoruz.
- * Bu fonksiyon artık SADECE tetiği çeker (non-blocking).
- * Tüm iş, stm32f4xx_it.c dosyasındaki I2C1_EV_IRQHandler tarafından yapılır.
- */
-bme280_return_stats bme280_read_data_dma(bme280_handle dev)
-{
-    uint32_t time;
+bme280_return_status bme280_configurate(bme280_handle dev, bme280_user_configs* config){
+	if(config==NULL) return _bme280_info_leak;
+	bme280_return_status status;
+	dev->ctrlhum_t.raw = config->ctrlhum_t.raw;
+	dev->config_t.raw = config->config_t.raw;
+	dev->ctrlmeas_t.raw = config->ctrlmeas_t.raw;
+	uint8_t sleep_mode=0;
+	status = write_register(dev, addr_ctrlmeas, &sleep_mode, 1);
+	if(status!=_bme280_ok) return _bme280_write_fail;
+	status = write_register(dev, addr_ctrlhum, &(dev->ctrlhum_t.raw), 1);
+	if(status!=_bme280_ok) return _bme280_write_fail;
+	status = write_register(dev, addr_config, &(dev->config_t.raw), 1);
+	if(status!=_bme280_ok) return _bme280_write_fail;
+	status = write_register(dev, addr_ctrlmeas, &(dev->ctrlmeas_t.raw), 1);
+	if(status!=_bme280_ok) return _bme280_write_fail;
+	return _bme280_ok;
+}
 
-    /* 1. I2C BUSY mı veya başka bir DMA işlemi yolda mı? */
-    time = dev->get_tick();
-    while(LL_I2C_IsActiveFlag_BUSY(dev->i2c_handle))
-    {
-        if(dev->get_tick() - time > dev->timeout) {
-            return bme280_fail; // BUSY hatası
-        }
-    }
+bme280_return_status bme280_read_data_poll(bme280_handle dev){
+	if(dev==NULL) return _bme280_info_leak;
+	return read_register(dev, addr_press_msb, dev->raw_data, 8);
+}
 
-    if (dev->i2c_dma_state != BME280_DMA_STATE_IDLE)
-    {
-        return bme280_fail; // Önceki DMA bitmemiş
-    }
+bme280_return_status bme280_get_value(bme280_handle dev){
+	if(dev==NULL) return _bme280_info_leak;
+	int32_t raw_pressure = (int32_t)((uint32_t)dev->raw_data[0]<<12)|((uint32_t)dev->raw_data[1]<<4)|((uint32_t)dev->raw_data[2]>>4);
+	int32_t raw_temperature = (int32_t)((uint32_t)dev->raw_data[3]<<12)|((uint32_t)dev->raw_data[4]<<4)|((uint32_t)dev->raw_data[5]>>4);
+	int32_t raw_humidity = (int32_t)((uint32_t)dev->raw_data[6]<<8)|(dev->raw_data[7]);
+	dev->temperature=(float)compensate_temperature(dev, raw_temperature)/100.0f;
+	dev->pressure=(float)compensate_pressure(dev, raw_pressure)/25600.0f;
+	dev->humidity=(float)compensate_humidity(dev, raw_humidity)/1024.0f;
+	return _bme280_ok;
+}
 
-    /* 2. Global handle'ı ve durumu ayarla (Interrupt'ların erişmesi için) */
-    g_bme280_dma_handle = dev;
-    dev->i2c_dma_state = BME280_DMA_STATE_START; // 1. Durum: START
+static void bme280_dma_cleanup(bme280_handle dev){
+	if(dev==NULL) return;
+	LL_I2C_DisableIT_EVT(dev->i2c_handle);
+	LL_I2C_DisableIT_BUF(dev->i2c_handle);
+	LL_I2C_DisableIT_ERR(dev->i2c_handle);
+	LL_I2C_DisableDMAReq_RX(dev->i2c_handle);
+	LL_I2C_DisableLastDMA(dev->i2c_handle);
+	LL_DMA_DisableIT_TC(DMA1, LL_DMA_STREAM_0);
+	LL_DMA_DisableIT_TE(DMA1, LL_DMA_STREAM_0);
+	LL_DMA_DisableStream(DMA1, LL_DMA_STREAM_0);
+	dev->dma_state=dma_state_idle;
+	active_dma_handle=NULL;
+}
 
-    /* 3. Tüm hata bayraklarını temizle (yeni bir başlangıç için) */
+bme280_return_status bme280_read_data_dma(bme280_handle dev){
+	if(dev==NULL) return _bme280_info_leak;
+	if(active_dma_handle!=NULL) return _bme280_dma_busy;
+	if(dev->dma_state!=dma_state_idle) return _bme280_dma_busy;
+	if(wait_for_condition(dev, flag_busy)!=_bme280_ok){
+		LL_I2C_GenerateStopCondition(dev->i2c_handle); return _bme280_i2c_busy;
+	}
+	active_dma_handle=dev;
+	dev->dma_state=dma_state_start_sent;
+
     LL_I2C_ClearFlag_AF(dev->i2c_handle);
     LL_I2C_ClearFlag_BERR(dev->i2c_handle);
     LL_DMA_ClearFlag_TC0(DMA1);
     LL_DMA_ClearFlag_TE0(DMA1);
 
-    /* 4. Gerekli kesmeleri (interrupt) AÇ */
-    // KURSTAN ÖĞRENDİĞİMİZ ANAHTAR: Olay kesmesini aç!
     LL_I2C_EnableIT_EVT(dev->i2c_handle);
-    LL_I2C_EnableIT_BUF(dev->i2c_handle); // <-- 3. Durum (TXE) için bu şart!
+    LL_I2C_EnableIT_BUF(dev->i2c_handle);
     LL_I2C_EnableIT_ERR(dev->i2c_handle);
-    // KURSTAN ÖĞRENDİĞİMİZ 2. ANAHTAR: DMA Hata kesmesini aç!
+
     LL_DMA_EnableIT_TE(DMA1, LL_DMA_STREAM_0);
     LL_DMA_EnableIT_TC(DMA1, LL_DMA_STREAM_0);
 
-    /* 5. Orkestrayı başlat: START Condition gönder */
-    // I2C1_EV_IRQHandler (SB bayrağı ile) şimdi tetiklenecek...
     LL_I2C_GenerateStartCondition(dev->i2c_handle);
+    return _bme280_ok;
+}
 
-    // Fonksiyon BİTTİ. Gerisi I2C1_EV_IRQHandler'da...
-    return bme280_ok;
+void bme280_i2c_error_handler(I2C_TypeDef* i2c_handle){
+	bme280_handle dev = active_dma_handle;
+	if(dev==NULL || dev->i2c_handle!=i2c_handle) return;
+	if (LL_I2C_IsActiveFlag_AF(dev->i2c_handle)) { LL_I2C_ClearFlag_AF(dev->i2c_handle); }
+	if (LL_I2C_IsActiveFlag_BERR(dev->i2c_handle)) { LL_I2C_ClearFlag_BERR(dev->i2c_handle); }
+	if (LL_I2C_IsActiveFlag_OVR(dev->i2c_handle)) { LL_I2C_ClearFlag_OVR(dev->i2c_handle); }
+	if(LL_I2C_IsActiveFlag_ARLO(dev->i2c_handle)) { LL_I2C_ClearFlag_ARLO(dev->i2c_handle); }
+	bme280_dma_cleanup(dev);
+}
+
+void bme280_dma_rx_handler(void){
+	bme280_handle dev = active_dma_handle;
+	if(dev==NULL) return;
+	if(LL_DMA_IsActiveFlag_TE0(DMA1)){
+		LL_DMA_ClearFlag_TE0(DMA1); bme280_dma_cleanup(dev);
+	}
+	if(LL_DMA_IsActiveFlag_TC0(DMA1)){
+		LL_DMA_ClearFlag_TC0(DMA1); LL_I2C_GenerateStopCondition(dev->i2c_handle); bme280_dma_cleanup(dev); bme280_get_value(dev); bme_data_ready=1;
+	}
+}
+
+void bme280_i2c_event_handler(I2C_TypeDef* i2c_handle){
+	bme280_handle dev = active_dma_handle;
+	if(dev==NULL || dev->i2c_handle != i2c_handle) return;
+	switch(dev->dma_state){
+	case dma_state_start_sent:{
+		if(LL_I2C_IsActiveFlag_SB(dev->i2c_handle)){
+			LL_I2C_TransmitData8(dev->i2c_handle, dev->i2c_addr);
+			dev->dma_state=dma_state_write_addr_sent;
+		}
+		break;
+	}
+	case dma_state_write_addr_sent:{
+		if(LL_I2C_IsActiveFlag_ADDR(dev->i2c_handle)){
+			LL_I2C_ClearFlag_ADDR(dev->i2c_handle);
+			LL_I2C_TransmitData8(dev->i2c_handle, addr_press_msb);
+			dev->dma_state=dma_state_reg_addr_sent;
+		}
+		break;
+	}
+	case dma_state_reg_addr_sent:{
+		if(LL_I2C_IsActiveFlag_TXE(dev->i2c_handle)){
+			LL_I2C_GenerateStartCondition(dev->i2c_handle);
+			dev->dma_state=dma_state_restart_sent;
+		}
+		break;
+	}
+	case dma_state_restart_sent:{
+		if(LL_I2C_IsActiveFlag_SB(dev->i2c_handle)){
+			LL_I2C_TransmitData8(dev->i2c_handle, dev->i2c_addr|1);
+			dev->dma_state=dma_state_read_addr_sent;
+		}
+		break;
+	}
+	case dma_state_read_addr_sent:{
+		if(LL_I2C_IsActiveFlag_ADDR(dev->i2c_handle)){
+			LL_DMA_DisableStream(DMA1, LL_DMA_STREAM_0);
+			LL_DMA_SetPeriphAddress(DMA1, LL_DMA_STREAM_0, LL_I2C_DMA_GetRegAddr(dev->i2c_handle));
+			LL_DMA_SetMemoryAddress(DMA1, LL_DMA_STREAM_0, (uint32_t)dev->raw_data);
+			LL_DMA_SetDataLength(DMA1, LL_DMA_STREAM_0, 8);
+			LL_I2C_EnableLastDMA(dev->i2c_handle);
+			LL_I2C_EnableDMAReq_RX(dev->i2c_handle);
+			LL_DMA_EnableStream(DMA1, LL_DMA_STREAM_0);
+			LL_I2C_AcknowledgeNextData(dev->i2c_handle, LL_I2C_ACK);
+			LL_I2C_DisableIT_EVT(dev->i2c_handle);
+			LL_I2C_DisableIT_BUF(dev->i2c_handle);
+			dev->dma_state=dma_state_reading;
+			LL_I2C_ClearFlag_ADDR(dev->i2c_handle);
+		}
+		break;
+	}
+	case dma_state_reading: break;
+	case dma_state_idle: break;
+	default: break;
+	}
 }
