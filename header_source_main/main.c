@@ -4,6 +4,16 @@
   * @file           : main.c
   * @brief          : Main program body
   ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2025 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
   */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
@@ -35,8 +45,7 @@
 volatile uint32_t uwtick=0;
 bme280_user_configs my_sensor_config;
 bme280_handle my_sensor;
-uint8_t success = 0; // Bu bayrak IT.c tarafından '1' yapılacak
-bme280_return_stats status;
+volatile uint8_t bme_data_ready = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -44,7 +53,6 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_I2C1_Init(void);
-static void MX_I2C2_Init(void);
 /* USER CODE BEGIN PFP */
 uint32_t my_tick(void);
 /* USER CODE END PFP */
@@ -88,21 +96,23 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DMA_Init();
-  MX_I2C1_Init(); // BME280 için
-  MX_I2C2_Init(); // (Kurstan kalan, şu an kullanılmıyor)
+  MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
   LL_SYSTICK_EnableIT();
   my_sensor_config.i2c_handle = I2C1;
-  my_sensor_config.i2c_addr = i2c_addr_0;
+  my_sensor_config.i2c_addr = bme280_i2c_addr0;
   my_sensor_config.get_tick = my_tick;
   my_sensor_config.timeout = 2000;
-  my_sensor_config.ctrlhum.bits.osrs_h = 0b011;
-  my_sensor_config.ctrlmeas.bits.osrs_t = 0b011;
-  my_sensor_config.ctrlmeas.bits.osrs_p = 0b011;
-  my_sensor_config.ctrlmeas.bits.mode = 0b11; // Normal mod
-  my_sensor_config.config.bits.filter = 0b000;
-  my_sensor_config.config.bits.t_sb = 0b011;
+  my_sensor_config.ctrlhum_t.bits.osrs_h = 0b011;
+  my_sensor_config.ctrlmeas_t.bits.osrs_t = 0b011;
+  my_sensor_config.ctrlmeas_t.bits.osrs_p = 0b011;
+  my_sensor_config.ctrlmeas_t.bits.mode = 0b11;
+  my_sensor_config.config_t.bits.filter = 0b000;
+  my_sensor_config.config_t.bits.t_sb = 0b011;
+  if(bme280_check_device(&my_sensor_config)!=_bme280_ok) Error_Handler();
   my_sensor = bme280_init(&my_sensor_config);
+  if(my_sensor==NULL) Error_Handler();
+  bme280_read_data_dma(my_sensor);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -112,50 +122,11 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-
-    /*
-     * YENİ NON-BLOCKING DÖNGÜ
-     * 1. DMA okumasını tetikle (bu fonksiyon artık beklemiyor)
-     * 2. 'success' bayrağının kesme (interrupt) tarafından 1 yapılmasını bekle
-     * 3. 'success' 1 olmazsa timeout ver
-     */
-	status = bme280_read_data_dma(my_sensor);
-
-    if(status == bme280_ok)
-    {
-        // Başarıyla tetiklendi.
-        // Kesmelerin (Interrupts) işini bitirmesi için bekle.
-        uint32_t wait_time = my_sensor_config.get_tick();
-
-        // success bayrağı DMA_IRQHandler'da '1' yapılacak
-        while(success == 0)
-        {
-            if(my_sensor_config.get_tick() - wait_time > 200) {
-                // 200ms içinde interrupt gelmedi, bir hata oldu demektir.
-                // (Burada bir hata LED'i yakabilirsin)
-                break; // Döngüyü kır ve tekrar dene
-            }
-        }
-    }
-    else
-    {
-        // Hata (örn: I2C BUSY veya önceki DMA bitmemiş)
-        // (Burada bir hata LED'i yakabilirsin)
-        // BUSY ise, I2C'yi resetlemeyi deneyebiliriz
-        if (LL_I2C_IsActiveFlag_BUSY(I2C1)) {
-            // I2C donanımını resetle
-            LL_I2C_Disable(I2C1);
-            LL_mDelay(1);
-            LL_I2C_Enable(I2C1);
-        }
-        LL_mDelay(500); // Tekrar denemeden önce biraz bekle
-    }
-
-    // Bir sonraki okuma için 'success' bayrağını sıfırla
-    success = 0;
-
-    // Okumalar arası bekleme süresi
-    LL_mDelay(250);
+	  if(bme_data_ready==1){
+		  bme_data_ready=0;
+		  bme280_read_data_dma(my_sensor);
+	  }
+	  LL_mDelay(100);
   }
   /* USER CODE END 3 */
 }
@@ -238,19 +209,26 @@ static void MX_I2C1_Init(void)
 
   /* I2C1 DMA Init */
 
-  /* I2C1_RX Init (Stream 0, Channel 1) */
+  /* I2C1_RX Init */
   LL_DMA_SetChannelSelection(DMA1, LL_DMA_STREAM_0, LL_DMA_CHANNEL_1);
+
   LL_DMA_SetDataTransferDirection(DMA1, LL_DMA_STREAM_0, LL_DMA_DIRECTION_PERIPH_TO_MEMORY);
-  LL_DMA_SetStreamPriorityLevel(DMA1, LL_DMA_STREAM_0, LL_DMA_PRIORITY_HIGH); // Önceliği Yüksek yap
+
+  LL_DMA_SetStreamPriorityLevel(DMA1, LL_DMA_STREAM_0, LL_DMA_PRIORITY_LOW);
+
   LL_DMA_SetMode(DMA1, LL_DMA_STREAM_0, LL_DMA_MODE_NORMAL);
+
   LL_DMA_SetPeriphIncMode(DMA1, LL_DMA_STREAM_0, LL_DMA_PERIPH_NOINCREMENT);
+
   LL_DMA_SetMemoryIncMode(DMA1, LL_DMA_STREAM_0, LL_DMA_MEMORY_INCREMENT);
+
   LL_DMA_SetPeriphSize(DMA1, LL_DMA_STREAM_0, LL_DMA_PDATAALIGN_BYTE);
+
   LL_DMA_SetMemorySize(DMA1, LL_DMA_STREAM_0, LL_DMA_MDATAALIGN_BYTE);
+
   LL_DMA_DisableFifoMode(DMA1, LL_DMA_STREAM_0);
 
   /* I2C1 interrupt Init */
-  /* KURSTA ÖĞRENDİĞİMİZ GİBİ, EVT (OLAY) KESMESİ AÇIK OLMALI! */
   NVIC_SetPriority(I2C1_EV_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(),0, 0));
   NVIC_EnableIRQ(I2C1_EV_IRQn);
   NVIC_SetPriority(I2C1_ER_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(),0, 0));
@@ -275,67 +253,7 @@ static void MX_I2C1_Init(void)
   LL_I2C_SetOwnAddress2(I2C1, 0);
   /* USER CODE BEGIN I2C1_Init 2 */
   LL_I2C_Enable(I2C1);
-  /* * NOT: LL_I2C_EnableDMAReq_RX(I2C1) satırını buradan kaldırdık.
-   * Artık I2C1_EV_IRQHandler içinde, tam doğru anda (ADDR bayrağı kalkınca)
-   * çağrılacak. Bu, "Yarış Durumu"nu (Race Condition) önler.
-   */
   /* USER CODE END I2C1_Init 2 */
-
-}
-
-/**
-  * @brief I2C2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_I2C2_Init(void)
-{
-
-  /* USER CODE BEGIN I2C2_Init 0 */
-  // Bu I2C2 portu şu an BME280 projesi için kullanılmıyor.
-  // Kurstan kalan bir ayar.
-  /* USER CODE END I2C2_Init 0 */
-
-  LL_I2C_InitTypeDef I2C_InitStruct = {0};
-
-  LL_GPIO_InitTypeDef GPIO_InitStruct = {0};
-
-  LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOB);
-  /**I2C2 GPIO Configuration
-  PB10   ------> I2C2_SCL
-  PB11   ------> I2C2_SDA
-  */
-  GPIO_InitStruct.Pin = LL_GPIO_PIN_10|LL_GPIO_PIN_11;
-  GPIO_InitStruct.Mode = LL_GPIO_MODE_ALTERNATE;
-  GPIO_InitStruct.Speed = LL_GPIO_SPEED_FREQ_VERY_HIGH;
-  GPIO_InitStruct.OutputType = LL_GPIO_OUTPUT_OPENDRAIN;
-  GPIO_InitStruct.Pull = LL_GPIO_PULL_NO;
-  GPIO_InitStruct.Alternate = LL_GPIO_AF_4;
-  LL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  /* Peripheral clock enable */
-  LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_I2C2);
-
-  /* USER CODE BEGIN I2C2_Init 1 */
-
-  /* USER CODE END I2C2_Init 1 */
-
-  /** I2C Initialization
-  */
-  LL_I2C_DisableOwnAddress2(I2C2);
-  LL_I2C_DisableGeneralCall(I2C2);
-  LL_I2C_EnableClockStretching(I2C2);
-  I2C_InitStruct.PeripheralMode = LL_I2C_MODE_I2C;
-  I2C_InitStruct.ClockSpeed = 100000;
-  I2C_InitStruct.DutyCycle = LL_I2C_DUTYCYCLE_2;
-  I2C_InitStruct.OwnAddress1 = 0;
-  I2C_InitStruct.TypeAcknowledge = LL_I2C_ACK;
-  I2C_InitStruct.OwnAddrSize = LL_I2C_OWNADDRESS1_7BIT;
-  LL_I2C_Init(I2C2, &I2C_InitStruct);
-  LL_I2C_SetOwnAddress2(I2C2, 0);
-  /* USER CODE BEGIN I2C2_Init 2 */
-  // LL_I2C_Enable(I2C2); // Kullanmıyorsak açmayalım
-  /* USER CODE END I2C2_Init 2 */
 
 }
 
@@ -368,8 +286,8 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
-  LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOB);
   LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOA);
+  LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOB);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -399,7 +317,7 @@ void Error_Handler(void)
 #ifdef USE_FULL_ASSERT
 /**
   * @brief  Reports the name of the source file and the source line number
-  * where the assert_param error has occurred.
+  *         where the assert_param error has occurred.
   * @param  file: pointer to the source file name
   * @param  line: assert_param error line source number
   * @retval None
